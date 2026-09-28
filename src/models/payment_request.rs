@@ -18,6 +18,7 @@ pub struct PaymentRequest {
     pub status: PaymentRequestStatus,
     pub payment_id: Option<Uuid>,
     pub expires_at: DateTime<Utc>,
+    pub cancelled_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

@@ -10,6 +10,8 @@ const DEFAULT_EXPIRY_SECS: i64 = 15 * 60;
 const MIN_EXPIRY_SECS: i64 = 60;
 const MAX_EXPIRY_SECS: i64 = 24 * 60 * 60;
 
+/// Retention window after which expired+cancelled rows are hard-deleted.
+pub const HARD_DELETE_AFTER_DAYS: i64 = 30;
 /// Default edge length (in pixels) of a rendered payment request QR code.
 pub const DEFAULT_QR_SIZE: u32 = 256;
 /// Smallest QR image we will render, to keep codes scannable.
@@ -70,6 +72,21 @@ pub async fn create_payment_request(
         .clamp(MIN_EXPIRY_SECS, MAX_EXPIRY_SECS);
     let expires_at = Utc::now() + Duration::seconds(ttl);
 
+    sqlx::query_as::<_, PaymentRequest>(
+        "INSERT INTO payment_requests (merchant_id, wallet_id, amount_stroops, asset, memo, expires_at)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         RETURNING id, merchant_id, wallet_id, amount_stroops, asset, memo, status, payment_id,
+                   expires_at, cancelled_at, created_at, updated_at",
+    )
+    .bind(merchant_id)
+    .bind(wallet_id)
+    .bind(amount_stroops)
+    .bind(&asset)
+    .bind(&memo)
+    .bind(expires_at)
+    .fetch_one(db)
+    .await
+    .map_err(PaymentRequestError::from)
     let mut attempt = 1;
     loop {
         let memo = generate_memo();
@@ -111,6 +128,7 @@ pub struct PaymentRequestWithWallet {
     pub status: PaymentRequestStatus,
     pub payment_id: Option<Uuid>,
     pub expires_at: chrono::DateTime<chrono::Utc>,
+    pub cancelled_at: Option<chrono::DateTime<chrono::Utc>>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
     pub address: String,
@@ -121,7 +139,40 @@ pub async fn payment_requests_by_merchant(
     db: &PgPool,
     merchant_id: Uuid,
     limit: i64,
+    include_cancelled: bool,
 ) -> Result<Vec<PaymentRequestWithWallet>, sqlx::Error> {
+    if include_cancelled {
+        sqlx::query_as::<_, PaymentRequestWithWallet>(
+            "SELECT pr.id, pr.merchant_id, pr.wallet_id, pr.amount_stroops, pr.asset, pr.memo,
+                    pr.status, pr.payment_id, pr.expires_at, pr.cancelled_at, pr.created_at, pr.updated_at,
+                    w.address, w.network
+               FROM payment_requests pr
+               JOIN wallets w ON w.id = pr.wallet_id
+              WHERE pr.merchant_id = $1
+              ORDER BY pr.created_at DESC
+              LIMIT $2",
+        )
+        .bind(merchant_id)
+        .bind(limit)
+        .fetch_all(db)
+        .await
+    } else {
+        sqlx::query_as::<_, PaymentRequestWithWallet>(
+            "SELECT pr.id, pr.merchant_id, pr.wallet_id, pr.amount_stroops, pr.asset, pr.memo,
+                    pr.status, pr.payment_id, pr.expires_at, pr.cancelled_at, pr.created_at, pr.updated_at,
+                    w.address, w.network
+               FROM payment_requests pr
+               JOIN wallets w ON w.id = pr.wallet_id
+              WHERE pr.merchant_id = $1
+                AND pr.cancelled_at IS NULL
+              ORDER BY pr.created_at DESC
+              LIMIT $2",
+        )
+        .bind(merchant_id)
+        .bind(limit)
+        .fetch_all(db)
+        .await
+    }
     sqlx::query_as::<_, PaymentRequestWithWallet>(
         "SELECT pr.id, pr.merchant_id, pr.wallet_id, pr.amount_stroops, pr.asset, pr.memo,
                 CASE WHEN pr.status = 'pending' AND pr.expires_at < now() THEN 'expired' ELSE pr.status END AS status,
@@ -147,13 +198,13 @@ pub async fn payment_requests_by_merchant_cursor(
     merchant_id: Uuid,
     limit: i64,
     cursor: Option<crate::pagination::Cursor>,
+    include_cancelled: bool,
 ) -> Result<Vec<PaymentRequestWithWallet>, sqlx::Error> {
-    match cursor {
-        Some(c) => {
+    match (cursor, include_cancelled) {
+        (Some(c), true) => {
             sqlx::query_as::<_, PaymentRequestWithWallet>(
                 "SELECT pr.id, pr.merchant_id, pr.wallet_id, pr.amount_stroops, pr.asset, pr.memo,
-                        CASE WHEN pr.status = 'pending' AND pr.expires_at < now() THEN 'expired' ELSE pr.status END AS status,
-                        pr.payment_id, pr.expires_at, pr.created_at, pr.updated_at,
+                        pr.status, pr.payment_id, pr.expires_at, pr.cancelled_at, pr.created_at, pr.updated_at,
                         w.address, w.network
                    FROM payment_requests pr
                    JOIN wallets w ON w.id = pr.wallet_id
@@ -169,15 +220,55 @@ pub async fn payment_requests_by_merchant_cursor(
             .fetch_all(db)
             .await
         }
-        None => {
+        (Some(c), false) => {
             sqlx::query_as::<_, PaymentRequestWithWallet>(
                 "SELECT pr.id, pr.merchant_id, pr.wallet_id, pr.amount_stroops, pr.asset, pr.memo,
+                        pr.status, pr.payment_id, pr.expires_at, pr.cancelled_at, pr.created_at, pr.updated_at,
                         CASE WHEN pr.status = 'pending' AND pr.expires_at < now() THEN 'expired' ELSE pr.status END AS status,
                         pr.payment_id, pr.expires_at, pr.created_at, pr.updated_at,
                         w.address, w.network
                    FROM payment_requests pr
                    JOIN wallets w ON w.id = pr.wallet_id
                   WHERE pr.merchant_id = $1
+                    AND pr.cancelled_at IS NULL
+                    AND (pr.created_at, pr.id) < ($2, $3)
+                  ORDER BY pr.created_at DESC, pr.id DESC
+                  LIMIT $4",
+            )
+            .bind(merchant_id)
+            .bind(c.created_at)
+            .bind(c.id)
+            .bind(limit + 1)
+            .fetch_all(db)
+            .await
+        }
+        (None, true) => {
+            sqlx::query_as::<_, PaymentRequestWithWallet>(
+                "SELECT pr.id, pr.merchant_id, pr.wallet_id, pr.amount_stroops, pr.asset, pr.memo,
+                        pr.status, pr.payment_id, pr.expires_at, pr.cancelled_at, pr.created_at, pr.updated_at,
+                        CASE WHEN pr.status = 'pending' AND pr.expires_at < now() THEN 'expired' ELSE pr.status END AS status,
+                        pr.payment_id, pr.expires_at, pr.created_at, pr.updated_at,
+                        w.address, w.network
+                   FROM payment_requests pr
+                   JOIN wallets w ON w.id = pr.wallet_id
+                  WHERE pr.merchant_id = $1
+                  ORDER BY pr.created_at DESC, pr.id DESC
+                  LIMIT $2",
+            )
+            .bind(merchant_id)
+            .bind(limit + 1)
+            .fetch_all(db)
+            .await
+        }
+        (None, false) => {
+            sqlx::query_as::<_, PaymentRequestWithWallet>(
+                "SELECT pr.id, pr.merchant_id, pr.wallet_id, pr.amount_stroops, pr.asset, pr.memo,
+                        pr.status, pr.payment_id, pr.expires_at, pr.cancelled_at, pr.created_at, pr.updated_at,
+                        w.address, w.network
+                   FROM payment_requests pr
+                   JOIN wallets w ON w.id = pr.wallet_id
+                  WHERE pr.merchant_id = $1
+                    AND pr.cancelled_at IS NULL
                   ORDER BY pr.created_at DESC, pr.id DESC
                   LIMIT $2",
             )
@@ -193,6 +284,8 @@ pub async fn payment_requests_by_merchant_cursor(
 /// so a request going stale needs no background job to flip it.
 pub async fn payment_request_by_id(db: &PgPool, id: Uuid) -> Result<Option<PaymentRequest>, sqlx::Error> {
     sqlx::query_as::<_, PaymentRequest>(
+        "SELECT id, merchant_id, wallet_id, amount_stroops, asset, memo, status, payment_id,
+                expires_at, cancelled_at, created_at, updated_at
         "SELECT id, merchant_id, wallet_id, amount_stroops, asset, memo,
                 CASE WHEN status = 'pending' AND expires_at < now() THEN 'expired' ELSE status END AS status,
                 payment_id, expires_at, created_at, updated_at
@@ -203,7 +296,31 @@ pub async fn payment_request_by_id(db: &PgPool, id: Uuid) -> Result<Option<Payme
     .await
 }
 
+/// Soft-delete: sets `cancelled_at` for a request owned by `merchant_id`.
+/// Returns the updated row, or `None` if it does not exist / is not owned /
+/// was already cancelled.
+pub async fn cancel_payment_request(
+    db: &PgPool,
+    id: Uuid,
+    merchant_id: Uuid,
+) -> Result<Option<PaymentRequest>, sqlx::Error> {
+    sqlx::query_as::<_, PaymentRequest>(
+        "UPDATE payment_requests
+            SET cancelled_at = now(), updated_at = now()
+          WHERE id = $1
+            AND merchant_id = $2
+            AND cancelled_at IS NULL
+      RETURNING id, merchant_id, wallet_id, amount_stroops, asset, memo, status, payment_id,
+                expires_at, cancelled_at, created_at, updated_at",
+    )
+    .bind(id)
+    .bind(merchant_id)
+    .fetch_optional(db)
+    .await
+}
+
 /// Looks up the pending request a detected deposit's memo correlates to, if any.
+/// Cancelled requests are never matched.
 pub async fn find_pending_by_wallet_and_memo(
     db: &PgPool,
     wallet_id: Uuid,
@@ -211,8 +328,10 @@ pub async fn find_pending_by_wallet_and_memo(
 ) -> Result<Option<PaymentRequest>, sqlx::Error> {
     sqlx::query_as::<_, PaymentRequest>(
         "SELECT id, merchant_id, wallet_id, amount_stroops, asset, memo, status, payment_id,
-                expires_at, created_at, updated_at
+                expires_at, cancelled_at, created_at, updated_at
            FROM payment_requests
+          WHERE wallet_id = $1 AND memo = $2 AND status = 'pending'
+            AND cancelled_at IS NULL",
           WHERE wallet_id = $1 AND memo = $2 AND status = $3",
     )
     .bind(wallet_id)
@@ -246,6 +365,18 @@ pub async fn mark_partial(db: &PgPool, id: Uuid, payment_id: Uuid) -> Result<(),
     .map(|_| ())
 }
 
+/// Hard-delete expired+cancelled payment requests whose cancellation is older
+/// than [`HARD_DELETE_AFTER_DAYS`]. Returns the number of rows removed.
+pub async fn hard_delete_expired_cancelled(db: &PgPool) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "DELETE FROM payment_requests
+          WHERE cancelled_at IS NOT NULL
+            AND cancelled_at < now() - interval '30 days'
+            AND expires_at < now()",
+    )
+    .execute(db)
+    .await?;
+    Ok(result.rows_affected())
 #[cfg(test)]
 mod tests {
     use super::*;

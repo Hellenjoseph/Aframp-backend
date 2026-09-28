@@ -378,6 +378,26 @@ Errors: `400 "create a wallet before generating payment requests"` if the mercha
 ### `GET /payment-requests`
 Auth required. The merchant's own requests, **newest first**. Scoped to the authenticated merchant — you cannot see another merchant's requests.
 
+Query:
+- `?limit=` (default 50, clamped 1–200)
+- `?cursor=` opaque keyset cursor from a previous page
+- `?include_cancelled=true` to include soft-deleted requests (default: excluded)
+
+`200` → `{ "data": [ ... ], "next_cursor": "..." | null }`.
+
+Cancelled requests are omitted from the default list so merchants can clean up history without losing the audit trail until the 30-day hard-delete job runs.
+
+### `DELETE /payment-requests/{id}`
+Auth required. Soft-deletes (archives) a payment request owned by the authenticated merchant by setting `cancelled_at`. Does **not** permanently remove the row.
+
+`200` → same payment-request object with `status: "cancelled"` and `cancelled_at` set.
+
+Errors:
+- `404` if the id does not exist
+- `403` if the request belongs to another merchant
+- `400` if it was already cancelled
+
+A background job hard-deletes rows that are both expired and cancelled for more than 30 days.
 Query: `?limit=` (default 50, clamped 1–200) and `?cursor=` (see [Pagination](#pagination)).
 
 `200` → `{ "data": [ …objects above… ], "next_cursor": "…" | null }`.
@@ -394,8 +414,9 @@ Query: `?limit=` (default 50, clamped 1–200) and `?cursor=` (see [Pagination](
 | `pending` | Not yet paid, not yet expired |
 | `paid` | A memo-matched payment was detected and confirmed |
 | `expired` | `expires_at` passed while still pending |
+| `cancelled` | Merchant soft-deleted the request (`cancelled_at` set) |
 
-`expired` is computed at read time, so it's accurate the moment you fetch it. A request that expires and is *then* paid still flips to `paid` — expiry doesn't block correlation.
+`expired` is computed at read time, so it's accurate the moment you fetch it. A request that expires and is *then* paid still flips to `paid` — expiry doesn't block correlation. `cancelled` always wins over `expired` at read time.
 
 ### `GET /payment-requests/{id}/status`
 **No auth** — lightweight public poll for customers after they submit a Stellar payment.
@@ -585,5 +606,6 @@ Worth knowing before you design around them:
 - **No token revocation.** `POST /logout` clears the browser's cookie; it cannot invalidate a JWT that has already been copied somewhere else.
 - **No rate limiting on the password check itself.** OTP sends are throttled (60s cooldown, 5/hour per phone), but nothing yet stops repeated wrong-password guesses against `/login` before it ever gets to that step.
 - **No cancel/delete on payment requests.** They can only expire naturally.
+- **`DELETE /payment-requests/{id}`** soft-cancels a request (sets `cancelled_at`). CORS allows `GET`/`POST`/`DELETE`.
 - **cNGN QR codes**, pending a real issuer address.
 - **Completed payouts**, pending funding (see `PRD.md` §9.1).
