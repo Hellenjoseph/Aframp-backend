@@ -34,12 +34,12 @@ Authorization: Bearer <token>
 
 The header takes precedence when both are present.
 
-Tokens are **HS256, valid for 24 hours** either way. Claims are `sub` (user id), `merchant_id`, `iat`, `exp`.
+Tokens are **HS256, valid for 24 hours** either way. Claims are `sub` (user id), `merchant_id`, `iat`, `exp`, and `orig_iat` (when the session was first issued, kept across refreshes).
 
 Two things worth building for up front:
 
 - **`merchant_id` is nullable.** `AuthResponse.merchant_id` and the JWT claim are both optional. Today signup always creates a merchant so it's always present, but the type allows `null` — an account without a merchant gets `400` from every merchant-scoped endpoint, not `401`. Don't assume non-null.
-- **Expiry is silent.** There's no refresh endpoint. When a token expires, calls start returning `401` with `{"error":"invalid or expired token","code":"INVALID_CREDENTIALS"}` — treat any `401` on a previously-working call as "send the user back to login."
+- **Refresh before expiry.** `POST /auth/refresh` swaps a still-valid token for a new 24h one, for up to 7 days from the original login. Once a token has expired (or the 7 days are up), calls return `401` with `{"error":"invalid or expired token","code":"INVALID_CREDENTIALS"}` — treat any `401` on a previously-working call as "send the user back to login."
 
 ### CORS
 
@@ -207,10 +207,19 @@ Never use floating-point arithmetic to accumulate balances — convert for displ
 
 ---
 
+## Pagination
+
+`GET /transactions`, `GET /payment-requests` and `GET /withdrawals` return
+`{ "data": [...], "next_cursor": "<token>" | null }`, newest first. To get the
+next page, repeat the request with `?cursor=<next_cursor>` (same `limit`);
+`next_cursor` is `null` on the last page. The cursor is an opaque token — don't
+parse or build it. Pages are keyed on `(created_at, id)`, so rows created while
+you page never shift or repeat later pages. A malformed cursor returns `400`.
+
 ## Endpoints
 
 ### `GET /health`
-Liveness probe. No auth. Returns `204 No Content` with an empty body.
+Liveness probe. No auth. Returns `200` with `{"status": "ok", "version": "<crate version>"}`.
 
 ### `GET /`
 Returns the literal string `aframp` (not JSON). Useful as a smoke test.
@@ -263,6 +272,9 @@ No auth. The **only** endpoint that ever issues a session, reached from either a
 
 Errors: `400` `OTP_INVALID` (wrong code — 5 wrong guesses and the challenge is dead, not just that attempt), `OTP_EXPIRED` (codes last 10 minutes), `OTP_LOCKED` (attempts exhausted — restart via `/signup` or `/login` for a new one). `404` `OTP_CHALLENGE_NOT_FOUND` for an unknown or already-consumed `challenge_id`.
 
+### `POST /auth/refresh`
+Auth required (bearer or session cookie; the token must not have expired). Returns a new token with the same body shape as `/verify-otp` and resets the session cookie. The new token expires 24h from now, but never more than 7 days after the original login; past that point this returns `401` ("session can no longer be refreshed; log in again"). Refresh doesn't revoke the old token — it stays valid until its own `exp`.
+
 ### `POST /logout`
 No auth — a browser holding an expired or malformed session still needs to clear it. Returns `204` and a `Set-Cookie` that expires `aframp_session` immediately.
 
@@ -286,6 +298,16 @@ Auth required. The signed-in user's profile. The JWT carries only ids, so call t
 `merchant_id` and `merchant_name` are `null` for an account with no merchant. The password hash is never serialized.
 
 ---
+
+### `PATCH /me`
+Auth required. Body: `{ "name"?: string, "phone_number"?: string }` (at least one). A new `name` (trimmed, 1–100 characters) applies immediately. A new `phone_number` (any common Nigerian format, normalized to `+234…`) is **not** switched yet: an OTP is sent to it and the response includes `phone_verification: { challenge_id, expires_in_secs }`. Complete it with `POST /verify-otp` (as at signup) to move the account to the new number.
+
+`200` → `{ "name": "...", "phone_number": "<number on file>", "phone_verification": null | {...} }`. `400` with `field` for invalid input, `409` if the number belongs to another account, `429` if OTP sends to that number are rate limited.
+
+### `DELETE /me`
+Auth required. Deletes the signed-in account (right to erasure under GDPR / NDPA). Returns `204` and clears the session cookie. Every token issued for the account stops working immediately (including for `/auth/refresh`), and the email can't log in again.
+
+**Data retention:** deletion is a soft delete. Personal data on the account is erased in place — email becomes `deleted-<id>@deleted.invalid`, name becomes "Deleted user", the phone number and password hash are cleared — and pending OTP challenges are removed. Financial records (payments, payment requests, withdrawals, wallets, balances) are kept, still linked to the anonymized account, because they're needed for the audit trail; withdrawal records keep the bank details they were paid out to for the same reason.
 
 ### `POST /wallet/create`
 Auth required. Generates a **real Stellar ed25519 keypair** for the merchant. The private key is AES-256-GCM encrypted server-side and never leaves it.
@@ -356,11 +378,9 @@ Errors: `400 "create a wallet before generating payment requests"` if the mercha
 ### `GET /payment-requests`
 Auth required. The merchant's own requests, **newest first**. Scoped to the authenticated merchant — you cannot see another merchant's requests.
 
-Query: `?limit=` (default 50, clamped 1–200).
+Query: `?limit=` (default 50, clamped 1–200) and `?cursor=` (see [Pagination](#pagination)).
 
-`200` → array of the object above.
-
-> Pagination is limit-only — there's no cursor or offset, so you can't page beyond the most recent 200.
+`200` → `{ "data": [ …objects above… ], "next_cursor": "…" | null }`.
 
 ### `GET /payment-requests/{id}`
 **No auth** — deliberately public, so a customer's device can read a request before paying.
@@ -416,7 +436,7 @@ Auth required. One row per asset the merchant has ever held. Returns `[]` for a 
 `available` is withdrawable; `pending` is detected but not yet confirmed. In practice `pending` is almost always `0` — deposits currently move to confirmed immediately (no confirmation-depth threshold yet).
 
 ### `GET /transactions`
-Auth required. Detected incoming payments, newest first. Query: `?limit=` (default 50, clamped 1–200).
+Auth required. Detected incoming payments, newest first. Query: `?limit=` (default 50, clamped 1–200) and `?cursor=` (see [Pagination](#pagination)). The response is a page: `{ "data": [...], "next_cursor": ... }`, with `data` items like this:
 
 `200` →
 ```json
@@ -465,9 +485,9 @@ Validation errors (`400`): `"insufficient available balance"`, `"withdrawals are
 > **Payouts do not currently complete.** The Paystack integration is real and correct, but Aframp's Paystack balance is unfunded, so live calls return `502` with *"Your balance is not enough to fulfil this request."* On failure the balance is **automatically refunded** and the withdrawal is recorded with `status: "failed"` and a `failure_reason` — no money or ledger record is lost. Treat `502` as "try later," not as data loss. Paystack's own minimum transfer is ₦50 = `500000000` stroops.
 
 ### `GET /withdrawals`
-Auth required. Newest first. Query: `?limit=` (default 50, clamped 1–200).
+Auth required. Newest first. Query: `?limit=` (default 50, clamped 1–200) and `?cursor=` (see [Pagination](#pagination)).
 
-`200` →
+`200` → a page, `{ "data": [...], "next_cursor": ... }`, with `data` items like:
 ```json
 [
   {
@@ -561,11 +581,9 @@ The `/admin` dashboard's login form uses the old one-step `/login` flow. If the 
 Worth knowing before you design around them:
 
 - **No websockets / SSE.** Payment status is poll-only.
-- **No refresh tokens.** A 24h expiry means a re-login, not a silent refresh.
+- **Sessions end after 7 days.** `POST /auth/refresh` extends a session up to 7 days from the original login; after that it's a re-login.
 - **No token revocation.** `POST /logout` clears the browser's cookie; it cannot invalidate a JWT that has already been copied somewhere else.
 - **No rate limiting on the password check itself.** OTP sends are throttled (60s cooldown, 5/hour per phone), but nothing yet stops repeated wrong-password guesses against `/login` before it ever gets to that step.
-- **No cursor pagination.** `limit` only, capped at 200.
 - **No cancel/delete on payment requests.** They can only expire naturally.
-- **No `PATCH`/`DELETE` anywhere** — and CORS only allows `GET`/`POST`, so adding one needs a server change too.
 - **cNGN QR codes**, pending a real issuer address.
 - **Completed payouts**, pending funding (see `PRD.md` §9.1).

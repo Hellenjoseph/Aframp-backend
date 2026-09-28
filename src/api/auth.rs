@@ -3,6 +3,7 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 
+use crate::auth::extractor::Session;
 use crate::auth::jwt;
 use crate::auth::password;
 use crate::error::{
@@ -104,7 +105,7 @@ pub async fn verify_otp(
         .await?;
 
     let (user, merchant_id) = match outcome {
-        VerifiedOutcome::Login(user) => {
+        VerifiedOutcome::Login(user) | VerifiedOutcome::PhoneChanged(user) => {
             let merchant = users::merchant_by_user(&state.db, user.id).await.map_err(internal)?;
             (user, merchant.map(|m| m.id))
         }
@@ -127,6 +128,24 @@ pub async fn verify_otp(
 pub async fn logout(State(state): State<AppState>) -> ApiResult<impl IntoResponse> {
     let cookie = state.cookie.clear().map_err(internal)?;
     Ok((StatusCode::NO_CONTENT, [(header::SET_COOKIE, cookie)]))
+}
+
+/// Exchanges a valid, unexpired session token for a fresh one (also reset
+/// as the session cookie), up to `jwt::MAX_SESSION_DAYS` after the original
+/// login; after that the user has to log in again.
+pub async fn refresh(State(state): State<AppState>, Session(claims): Session) -> ApiResult<impl IntoResponse> {
+    let token = jwt::refresh(&state.jwt_secret, &claims).map_err(|err| match err {
+        jwt::RefreshError::Signing => internal(err),
+        _ => unauthorized(ErrorCode::InvalidCredentials, &err.to_string()),
+    })?;
+    authenticated(
+        &state,
+        AuthResponse {
+            token,
+            user_id: claims.sub,
+            merchant_id: claims.merchant_id,
+        },
+    )
 }
 
 /// Sets the session cookie for browsers and echoes the token for API clients.

@@ -6,6 +6,7 @@ use axum::Json;
 use crate::auth::{cookie, jwt};
 use crate::auth::jwt::Claims;
 use crate::error::{forbidden, internal, ApiError, ErrorCode};
+use crate::services::users;
 use crate::AppState;
 
 #[derive(Debug, Clone)]
@@ -14,6 +15,26 @@ pub struct AuthUser {
     pub merchant_id: Option<uuid::Uuid>,
 }
 
+/// The verified claims of the presented session token (bearer or cookie),
+/// for handlers that need more than the user id — e.g. token refresh.
+#[derive(Debug)]
+pub struct Session(pub Claims);
+
+impl FromRequestParts<AppState> for Session {
+    type Rejection = (StatusCode, Json<ApiError>);
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        authenticate_active(parts, state).await.map(Session)
+    }
+}
+
+/// Same session proof as [`AuthUser`], but additionally requires the `is_admin`
+/// JWT claim. The claim is baked in at login and not re-checked against the
+/// database, so revoking admin access takes up to [`jwt::TOKEN_TTL_HOURS`] to
+/// take effect on outstanding tokens.
 /// Same session proof as [`AuthUser`], but additionally requires admin rights.
 /// The `is_admin` JWT claim is only a cheap first filter: every admin request
 /// also re-reads `users.is_admin`, so revoking admin access in the database
@@ -85,6 +106,22 @@ fn authenticate(parts: &Parts, state: &AppState) -> Result<Claims, (StatusCode, 
         .map_err(|_| (StatusCode::UNAUTHORIZED, Json(ApiError { code: ErrorCode::InvalidCredentials, error: "invalid or expired token".into(), field: None })))
 }
 
+/// Verifies the token and that its account still exists and hasn't been
+/// deleted, so deleting an account revokes every token issued for it.
+async fn authenticate_active(
+    parts: &Parts,
+    state: &AppState,
+) -> Result<Claims, (StatusCode, Json<ApiError>)> {
+    let claims = authenticate(parts, state)?;
+    if !users::is_active(&state.db, claims.sub).await.map_err(internal)? {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(ApiError { code: ErrorCode::InvalidCredentials, error: "invalid or expired token".into(), field: None }),
+        ));
+    }
+    Ok(claims)
+}
+
 impl FromRequestParts<AppState> for AuthUser {
     type Rejection = (StatusCode, Json<ApiError>);
 
@@ -92,6 +129,7 @@ impl FromRequestParts<AppState> for AuthUser {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
+        let claims = authenticate_active(parts, state).await?;
         // Merchant API keys take precedence over session JWTs so server-to-server
         // integrations can authenticate without an OTP login.
         if let Some(token) = bearer_token(parts) {
@@ -114,7 +152,7 @@ impl FromRequestParts<AppState> for AdminUser {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let claims = authenticate(parts, state)?;
+        let claims = authenticate_active(parts, state).await?;
         if !claims.is_admin {
             return Err(forbidden(ErrorCode::Forbidden, "admin access required"));
         }
