@@ -3,6 +3,9 @@ use std::sync::Arc;
 
 use crate::auth::cookie::{CookieConfig, SameSite};
 
+/// Default request body limit (1MB) used when `MAX_REQUEST_BODY_BYTES` is unset.
+pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
+
 #[derive(Clone)]
 pub struct SecretString(Arc<String>);
 
@@ -82,6 +85,10 @@ pub struct AppConfig {
     /// `Secure` on, `SameSite=Lax`. Browsers treat localhost as a secure
     /// context, so the defaults also work for local development over HTTP.
     pub cookie: CookieConfig,
+    /// Maximum accepted request body size in bytes. Applied via
+    /// `RequestBodyLimitLayer`; requests over this limit are rejected with a
+    /// 413 before reaching a handler. Defaults to 1MB.
+    pub max_request_body_bytes: usize,
 }
 
 impl AppConfig {
@@ -125,6 +132,16 @@ impl AppConfig {
             .and_then(|v| v.trim().parse::<usize>().ok())
             .filter(|&v| v > 0)
             .unwrap_or(50);
+        let max_request_body_bytes = match std::env::var("MAX_REQUEST_BODY_BYTES") {
+            Err(_) => DEFAULT_MAX_REQUEST_BODY_BYTES,
+            Ok(value) => value
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| format!("MAX_REQUEST_BODY_BYTES must be a positive integer, got `{value}`"))?,
+        };
+        if max_request_body_bytes == 0 {
+            return Err("MAX_REQUEST_BODY_BYTES must be greater than 0".into());
+        }
 
         Ok(Self {
             database_url: env("DATABASE_URL")?,
@@ -155,6 +172,7 @@ impl AppConfig {
                 secure: cookie_secure,
                 same_site: cookie_same_site,
             },
+            max_request_body_bytes,
         })
     }
 }
@@ -218,6 +236,7 @@ mod tests {
                     secure: true,
                     same_site: SameSite::Lax,
                 },
+                max_request_body_bytes: DEFAULT_MAX_REQUEST_BODY_BYTES,
             }
         );
         assert!(!config_debug.contains("jwt-secret-value"));
@@ -237,5 +256,7 @@ mod tests {
             .filter(|&v| v > 0)
             .unwrap_or(50);
         assert_eq!(concurrency, 50);
+    fn max_request_body_bytes_defaults_to_one_megabyte() {
+        assert_eq!(DEFAULT_MAX_REQUEST_BODY_BYTES, 1024 * 1024);
     }
 }
