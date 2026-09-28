@@ -185,6 +185,98 @@ async fn payment_request_list_requires_auth() {
 }
 
 #[tokio::test]
+async fn payment_request_list_xlm_sep7_uri_is_non_null() {
+    let Some(state) = state().await else {
+        return;
+    };
+    let app = aframp::router(state.clone());
+    let (token, _) = ensure_merchant(&app, "pr_list_sep7_nonnull").await;
+    create_wallet(&app, &token).await;
+
+    // Create two XLM payment requests.
+    for amount in [5_000_000i64, 10_000_000i64] {
+        let (status, json) = send(
+            app.clone(),
+            "POST",
+            "/payment-requests",
+            Some(&token),
+            Some(json!({ "amount_stroops": amount })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "create failed: {json}");
+    }
+
+    let (status, list) = send(app.clone(), "GET", "/payment-requests", Some(&token), None).await;
+    assert_eq!(status, StatusCode::OK, "list failed: {list}");
+    let rows = list.as_array().expect("list response should be an array");
+    assert!(!rows.is_empty(), "should have at least one payment request in the list");
+
+    for row in rows {
+        assert_eq!(row["asset"], "XLM", "test only creates XLM requests");
+        let uri = row["sep7_uri"].as_str().unwrap_or_else(|| {
+            panic!(
+                "sep7_uri must be non-null for XLM request id={} — \
+                 if this is null the list query is missing the wallet JOIN",
+                row["id"]
+            )
+        });
+        assert!(
+            uri.starts_with("web+stellar:pay?destination="),
+            "sep7_uri should be a valid SEP-0007 URI: {uri}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn payment_request_list_sep7_uri_matches_get_by_id() {
+    let Some(state) = state().await else {
+        return;
+    };
+    let app = aframp::router(state.clone());
+    let (token, _) = ensure_merchant(&app, "pr_list_sep7_match").await;
+    create_wallet(&app, &token).await;
+
+    let (status, created) = send(
+        app.clone(),
+        "POST",
+        "/payment-requests",
+        Some(&token),
+        Some(json!({ "amount_stroops": 15_000_000 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "create failed: {created}");
+    let id = created["id"].as_str().unwrap();
+
+    // Fetch the single request publicly (as a customer wallet would).
+    let (status, by_id) = send(app.clone(), "GET", &format!("/payment-requests/{id}"), None, None).await;
+    assert_eq!(status, StatusCode::OK, "GET by id failed: {by_id}");
+    let sep7_by_id = by_id["sep7_uri"]
+        .as_str()
+        .expect("GET by id should return a sep7_uri for XLM");
+
+    // Fetch via the authenticated list endpoint.
+    let (status, list) = send(app.clone(), "GET", "/payment-requests", Some(&token), None).await;
+    assert_eq!(status, StatusCode::OK, "list failed: {list}");
+    let rows = list.as_array().expect("list response should be an array");
+
+    let list_row = rows
+        .iter()
+        .find(|r| r["id"] == id)
+        .expect("the created request should appear in the list");
+
+    let sep7_in_list = list_row["sep7_uri"]
+        .as_str()
+        .expect("sep7_uri must be non-null in the list for an XLM request");
+
+    assert_eq!(
+        sep7_by_id, sep7_in_list,
+        "sep7_uri from GET /payment-requests/{{id}} must match the value in the list \
+         — a mismatch means the list query uses a different address or parameters"
+    );
+}
+
+
+#[tokio::test]
 async fn payment_request_marked_paid_on_memo_correlated_deposit() {
     let Some(state) = state().await else {
         return;

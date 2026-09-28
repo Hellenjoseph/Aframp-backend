@@ -115,6 +115,7 @@ pub async fn payment_requests_by_merchant_cursor(
                    FROM payment_requests pr
                    JOIN wallets w ON w.id = pr.wallet_id
                   WHERE pr.merchant_id = $1
+                    AND w.address IS NOT NULL
                     AND (pr.created_at, pr.id) < ($2, $3)
                   ORDER BY pr.created_at DESC, pr.id DESC
                   LIMIT $4",
@@ -134,6 +135,7 @@ pub async fn payment_requests_by_merchant_cursor(
                    FROM payment_requests pr
                    JOIN wallets w ON w.id = pr.wallet_id
                   WHERE pr.merchant_id = $1
+                    AND w.address IS NOT NULL
                   ORDER BY pr.created_at DESC, pr.id DESC
                   LIMIT $2",
             )
