@@ -11,6 +11,16 @@ Aframp is in active MVP development and has no tagged releases yet. Only the lat
 | `0.1.x` (latest `master`) | Yes |
 | Older commits and forks | No |
 
+## Personal information in application logs
+
+Application logs must not contain raw personal information or complete
+third-party response payloads. In particular, do not log merchant or customer
+email addresses, phone numbers, names, account numbers, or payment-provider
+response bodies. Use stable error codes and opaque entity identifiers when
+diagnostic context is needed. Redact or omit sensitive values before passing
+them to tracing fields; production log scrubbing is defense in depth, not a
+replacement for safe logging at the source.
+
 ## Reporting a vulnerability
 
 **Do not open a public issue, pull request, or discussion for a security problem.**
