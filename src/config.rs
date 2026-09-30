@@ -146,8 +146,8 @@ impl AppConfig {
         Ok(Self {
             database_url: env("DATABASE_URL")?,
             bind_addr: std::env::var("APP_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".into()),
-            jwt_secret: SecretString::new(env("JWT_SECRET")?),
-            webhook_secret: SecretString::new(env("WEBHOOK_SECRET")?),
+            jwt_secret: SecretString::new(secret_min32("JWT_SECRET")?),
+            webhook_secret: SecretString::new(secret_min32("WEBHOOK_SECRET")?),
             stellar_system_wallet: Arc::new(env("STELLAR_SYSTEM_WALLET_ADDRESS")?),
             stellar_horizon_url: std::env::var("STELLAR_HORIZON_URL")
                 .unwrap_or_else(|_| "https://horizon-testnet.stellar.org".into()),
@@ -181,6 +181,23 @@ fn env(name: &str) -> Result<String, String> {
     std::env::var(name).map_err(|_| format!("{name} is required"))
 }
 
+/// Reads an environment variable and rejects it if it is shorter than 32
+/// characters. HMAC-SHA256 is only as strong as its key; keys below 32 bytes
+/// fall below the NIST SP 800-107 minimum recommendation.
+///
+/// Generate a safe value with: `openssl rand -hex 32`
+fn secret_min32(name: &str) -> Result<String, String> {
+    let value = env(name)?;
+    if value.len() < 32 {
+        return Err(format!(
+            "{name} must be at least 32 characters (got {}). \
+             Generate a strong secret with: openssl rand -hex 32",
+            value.len()
+        ));
+    }
+    Ok(value)
+}
+
 fn flag(name: &str, default: bool) -> Result<bool, String> {
     match std::env::var(name) {
         Err(_) => Ok(default),
@@ -210,6 +227,88 @@ mod tests {
         let display_str = format!("{}", secret);
         assert_eq!(display_str, "[REDACTED]");
         assert!(!display_str.contains("my-secret-key"));
+    }
+
+    /// Populates every required env var with valid values so `AppConfig::from_env`
+    /// can succeed. Call this before overriding individual vars in a test.
+    fn set_valid_env() {
+        // A 64-char hex string — well above the 32-char minimum.
+        let long_secret = "a".repeat(64);
+        std::env::set_var("DATABASE_URL", "postgres://localhost/test");
+        std::env::set_var("WALLET_ENCRYPTION_KEY", &long_secret);
+        std::env::set_var("STELLAR_SYSTEM_WALLET_ADDRESS", "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN");
+        std::env::set_var("PAYSTACK_SECRET_KEY", "sk_test_placeholder");
+        std::env::set_var("OTP_HMAC_SECRET", &long_secret);
+        std::env::set_var("OTP_PROVIDER", "mock");
+        // Set the secrets to valid values; individual tests may override these.
+        std::env::set_var("JWT_SECRET", &long_secret);
+        std::env::set_var("WEBHOOK_SECRET", &long_secret);
+    }
+
+    #[test]
+    fn jwt_secret_too_short_is_rejected() {
+        set_valid_env();
+        std::env::set_var("JWT_SECRET", "tooshort");
+
+        let err = AppConfig::from_env().unwrap_err();
+        assert!(
+            err.contains("JWT_SECRET"),
+            "error should name the failing variable: {err}"
+        );
+        assert!(
+            err.contains("32"),
+            "error should mention the 32-character minimum: {err}"
+        );
+        assert!(
+            err.contains("openssl rand -hex 32"),
+            "error should include the generation hint: {err}"
+        );
+    }
+
+    #[test]
+    fn webhook_secret_too_short_is_rejected() {
+        set_valid_env();
+        std::env::set_var("WEBHOOK_SECRET", "tooshort");
+
+        let err = AppConfig::from_env().unwrap_err();
+        assert!(
+            err.contains("WEBHOOK_SECRET"),
+            "error should name the failing variable: {err}"
+        );
+        assert!(
+            err.contains("32"),
+            "error should mention the 32-character minimum: {err}"
+        );
+        assert!(
+            err.contains("openssl rand -hex 32"),
+            "error should include the generation hint: {err}"
+        );
+    }
+
+    #[test]
+    fn secret_exactly_32_chars_is_accepted() {
+        set_valid_env();
+        // Exactly 32 characters — right at the boundary, must pass.
+        std::env::set_var("JWT_SECRET", "a".repeat(32));
+        std::env::set_var("WEBHOOK_SECRET", "b".repeat(32));
+
+        let result = AppConfig::from_env();
+        assert!(
+            result.is_ok(),
+            "32-character secrets should be accepted: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn jwt_secret_31_chars_is_rejected() {
+        set_valid_env();
+        // 31 characters — one below the boundary, must fail.
+        std::env::set_var("JWT_SECRET", "a".repeat(31));
+
+        let err = AppConfig::from_env().unwrap_err();
+        assert!(err.contains("JWT_SECRET"), "error must identify the variable: {err}");
+        assert!(err.contains("31"), "error should report the actual length: {err}");
     }
 
     #[test]
