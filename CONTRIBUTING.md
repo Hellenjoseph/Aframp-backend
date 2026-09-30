@@ -80,6 +80,67 @@ here. To run only the unit tests without a database:
 cargo test --lib
 ```
 
+## Pre-commit hooks (optional but recommended)
+
+A `.pre-commit-config.yaml` is included in the repository root. It runs
+`cargo fmt --check` and `cargo clippy -- -D warnings` locally before each
+commit, catching the same failures the CI `lint` job catches — before they
+ever reach the remote.
+
+The hooks are **opt-in**: nothing breaks if you don't install them. They are
+recommended for contributors who want faster feedback.
+
+### Setup
+
+1. Install the `pre-commit` tool (Python-based, works on macOS, Linux, and
+   Windows):
+
+   ```bash
+   pip install pre-commit
+   # or, if you use Homebrew:
+   brew install pre-commit
+   ```
+
+2. Install the hooks into your local clone:
+
+   ```bash
+   pre-commit install
+   ```
+
+   This writes a `.git/hooks/pre-commit` script that runs the configured
+   hooks automatically on every `git commit`.
+
+3. (Optional) Run all hooks against every file without making a commit:
+
+   ```bash
+   pre-commit run --all-files
+   ```
+
+### What the hooks do
+
+| Hook | Command | When it fails |
+|------|---------|---------------|
+| `cargo-fmt-check` | `cargo fmt --all -- --check` | Any Rust file is not formatted. Run `cargo fmt --all` to fix. |
+| `cargo-clippy` | `cargo clippy -- -D warnings` | Any clippy lint warning is present. Fix the warning or, if intentional, add `#[allow(...)]` in the source. |
+
+### Skipping hooks
+
+If you need to bypass the hooks for a specific commit (e.g. a work-in-progress
+commit on a local branch that you plan to `--amend` before pushing):
+
+```bash
+git commit --no-verify
+```
+
+This should not be used on commits you intend to push upstream — CI will
+catch the same failures and your PR will be blocked.
+
+### Keeping hooks up to date
+
+```bash
+pre-commit autoupdate
+```
+
 ## Questions?
 
 Open a Discussion or comment on the relevant issue.
